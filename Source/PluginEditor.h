@@ -6,6 +6,7 @@
 /**
  * Waveform display component showing the loaded sample
  * Click on the waveform to set the start offset position
+ * Supports zoom for more precise control
  */
 class WaveformDisplay : public juce::Component, public juce::Timer {
 public:
@@ -35,10 +36,21 @@ public:
       return;
     }
 
-    // Draw waveform
+    // Draw waveform with zoom
     auto waveformBounds = bounds.reduced(10.0f, 15.0f);
     float midY = waveformBounds.getCentreY();
     float height = waveformBounds.getHeight() / 2.0f;
+
+    int numSamples = buffer.getNumSamples();
+
+    // Calculate visible range based on zoom
+    int visibleSamples = static_cast<int>(numSamples / zoomLevel);
+    int startSampleView =
+        static_cast<int>(viewOffset * (numSamples - visibleSamples));
+    int endSampleView = std::min(startSampleView + visibleSamples, numSamples);
+
+    float samplesPerPixel =
+        static_cast<float>(visibleSamples) / waveformBounds.getWidth();
 
     // Create gradient for waveform
     juce::ColourGradient gradient(
@@ -47,17 +59,12 @@ public:
     g.setGradientFill(gradient);
 
     juce::Path waveformPath;
-    int numSamples = buffer.getNumSamples();
-    float samplesPerPixel =
-        static_cast<float>(numSamples) / waveformBounds.getWidth();
-
-    // Draw approximate waveform (using max values for each pixel column)
     waveformPath.startNewSubPath(waveformBounds.getX(), midY);
 
     for (float x = 0; x < waveformBounds.getWidth(); x += 1.0f) {
-      int startSample = static_cast<int>(x * samplesPerPixel);
-      int endSample =
-          std::min(static_cast<int>((x + 1) * samplesPerPixel), numSamples);
+      int startSample = startSampleView + static_cast<int>(x * samplesPerPixel);
+      int endSample = std::min(
+          startSample + static_cast<int>(samplesPerPixel) + 1, numSamples);
 
       float maxVal = 0.0f;
       for (int s = startSample; s < endSample; ++s) {
@@ -71,9 +78,9 @@ public:
 
     // Mirror for bottom half
     for (float x = waveformBounds.getWidth() - 1; x >= 0; x -= 1.0f) {
-      int startSample = static_cast<int>(x * samplesPerPixel);
-      int endSample =
-          std::min(static_cast<int>((x + 1) * samplesPerPixel), numSamples);
+      int startSample = startSampleView + static_cast<int>(x * samplesPerPixel);
+      int endSample = std::min(
+          startSample + static_cast<int>(samplesPerPixel) + 1, numSamples);
 
       float maxVal = 0.0f;
       for (int s = startSample; s < endSample; ++s) {
@@ -89,12 +96,16 @@ public:
     g.fillPath(waveformPath);
 
     // Draw start offset marker (green line)
-    float startOffset = static_cast<float>(processor.getStartOffsetSeconds() *
-                                           processor.getHostSampleRate()) /
-                        numSamples;
-    if (startOffset > 0.0f && startOffset < 1.0f) {
+    double offsetSeconds = processor.getStartOffsetSeconds();
+    double offsetSamples = offsetSeconds * processor.getHostSampleRate();
+
+    // Check if offset is in visible range
+    if (offsetSamples >= startSampleView && offsetSamples < endSampleView) {
+      float offsetProgress =
+          static_cast<float>(offsetSamples - startSampleView) / visibleSamples;
       float offsetX =
-          waveformBounds.getX() + startOffset * waveformBounds.getWidth();
+          waveformBounds.getX() + offsetProgress * waveformBounds.getWidth();
+
       g.setColour(juce::Colour(0xff00ff00)); // Bright green
       g.drawLine(offsetX, waveformBounds.getY(), offsetX,
                  waveformBounds.getBottom(), 3.0f);
@@ -109,19 +120,25 @@ public:
 
     // Draw playback position line (white)
     if (processor.isPlaying()) {
-      float progress = processor.getPlaybackProgress();
-      float lineX =
-          waveformBounds.getX() + progress * waveformBounds.getWidth();
-
-      g.setColour(juce::Colours::white);
-      g.drawLine(lineX, waveformBounds.getY(), lineX,
-                 waveformBounds.getBottom(), 2.0f);
+      float playbackSample = processor.getPlaybackProgress() * numSamples;
+      if (playbackSample >= startSampleView && playbackSample < endSampleView) {
+        float progress = (playbackSample - startSampleView) / visibleSamples;
+        float lineX =
+            waveformBounds.getX() + progress * waveformBounds.getWidth();
+        g.setColour(juce::Colours::white);
+        g.drawLine(lineX, waveformBounds.getY(), lineX,
+                   waveformBounds.getBottom(), 2.0f);
+      }
     }
 
-    // Draw instruction text at bottom
+    // Draw zoom info at bottom
     g.setColour(juce::Colour(0xff666666));
     g.setFont(10.0f);
-    g.drawText("Click to set start position", bounds.removeFromBottom(15),
+    juce::String zoomText =
+        (zoomLevel > 1.01f) ? juce::String::formatted(
+                                  "Zoom: %.0fx | Click to set start", zoomLevel)
+                            : "Click to set start position";
+    g.drawText(zoomText, bounds.removeFromBottom(15),
                juce::Justification::centred);
   }
 
@@ -134,15 +151,48 @@ public:
     if (processor.hasSampleLoaded()) {
       auto bounds = getLocalBounds().toFloat().reduced(10.0f, 15.0f);
       float clickX = static_cast<float>(event.x);
-      float progress = (clickX - bounds.getX()) / bounds.getWidth();
-      progress = std::max(0.0f, std::min(1.0f, progress));
+      float clickProgress = (clickX - bounds.getX()) / bounds.getWidth();
+      clickProgress = std::max(0.0f, std::min(1.0f, clickProgress));
 
-      processor.setStartOffsetFromProgress(progress);
+      // Convert click to actual sample position accounting for zoom
+      int numSamples = processor.getSampleBuffer().getNumSamples();
+      int visibleSamples = static_cast<int>(numSamples / zoomLevel);
+      int startSampleView =
+          static_cast<int>(viewOffset * (numSamples - visibleSamples));
+
+      int clickedSample =
+          startSampleView + static_cast<int>(clickProgress * visibleSamples);
+      float actualProgress = static_cast<float>(clickedSample) / numSamples;
+
+      processor.setStartOffsetFromProgress(actualProgress);
       repaint();
 
-      // Notify parent to update offset display
       if (onOffsetChanged)
         onOffsetChanged();
+    }
+  }
+
+  void setZoom(float newZoom) {
+    zoomLevel = std::max(1.0f, std::min(100.0f, newZoom));
+    repaint();
+  }
+
+  float getZoom() const { return zoomLevel; }
+
+  void setViewOffset(float offset) {
+    viewOffset = std::max(0.0f, std::min(1.0f, offset));
+    repaint();
+  }
+
+  float getViewOffset() const { return viewOffset; }
+
+  // Scroll wheel to adjust view position when zoomed
+  void mouseWheelMove(const juce::MouseEvent &,
+                      const juce::MouseWheelDetails &wheel) override {
+    if (zoomLevel > 1.01f) {
+      viewOffset =
+          std::max(0.0f, std::min(1.0f, viewOffset - wheel.deltaY * 0.1f));
+      repaint();
     }
   }
 
@@ -150,12 +200,13 @@ public:
 
 private:
   BackingTrackTriggerProcessor &processor;
+  float zoomLevel = 1.0f;
+  float viewOffset = 0.0f; // 0 = start, 1 = end
 };
 
 //==============================================================================
 /**
- * Plugin editor with file browser, large waveform display, and start offset
- * control
+ * Plugin editor with file browser, zoomable waveform, and millisecond input
  */
 class BackingTrackTriggerEditor : public juce::AudioProcessorEditor {
 public:
@@ -172,12 +223,16 @@ private:
   juce::TextButton loadButton{"Load Sample"};
   juce::TextButton playButton{"Play"};
   juce::TextButton stopButton{"Stop"};
-  juce::TextButton resetOffsetButton{"Reset Start"};
+  juce::TextButton resetOffsetButton{"Reset"};
+  juce::TextButton zoomInButton{"+"};
+  juce::TextButton zoomOutButton{"-"};
   juce::Label sampleNameLabel;
   juce::Label durationLabel;
-  juce::Label fileInfoLabel; // Shows sample rate, channels, bit depth
-  juce::Label hostInfoLabel; // Shows host sample rate & resampling status
-  juce::Label offsetLabel;   // Shows current start offset
+  juce::Label fileInfoLabel;
+  juce::Label hostInfoLabel;
+  juce::Label offsetDisplayLabel;
+  juce::Label offsetInputLabel;
+  juce::TextEditor offsetInput; // Text input for milliseconds
   juce::Label instructionLabel;
   WaveformDisplay waveformDisplay;
 
@@ -185,6 +240,7 @@ private:
 
   void loadButtonClicked();
   void updateSampleInfo();
+  void applyOffsetFromInput();
 
   JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(BackingTrackTriggerEditor)
 };
