@@ -7,17 +7,19 @@ add_subdirectory(JUCE)
 
 # Plugin configuration
 juce_add_plugin(BackingTrackTrigger
-    COMPANY_NAME "AntonyleeDale"
+    COMPANY_NAME "LEEDALE"
     IS_SYNTH TRUE
     NEEDS_MIDI_INPUT TRUE
     NEEDS_MIDI_OUTPUT FALSE
     IS_MIDI_EFFECT FALSE
     EDITOR_WANTS_KEYBOARD_FOCUS FALSE
     COPY_PLUGIN_AFTER_BUILD TRUE
-    PLUGIN_MANUFACTURER_CODE Adal
+    PLUGIN_MANUFACTURER_CODE Ldal
     PLUGIN_CODE Bktr
     FORMATS VST3 AU Standalone
     PRODUCT_NAME "Backing Track Trigger"
+    VST3_PRODUCT_NAME "Backing Track Trigger (VST3)"
+    AU_PRODUCT_NAME "Backing Track Trigger (AU)"
 )
 
 # Source files
