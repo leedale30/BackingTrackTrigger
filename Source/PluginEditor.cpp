@@ -26,6 +26,18 @@ BackingTrackTriggerEditor::BackingTrackTriggerEditor(
   stopButton.onClick = [this] { processorRef.stopPlayback(); };
   addAndMakeVisible(stopButton);
 
+  // Set up the Reset Offset button
+  resetOffsetButton.setColour(juce::TextButton::buttonColourId,
+                              juce::Colour(0xff6a5acd));
+  resetOffsetButton.setColour(juce::TextButton::textColourOnId,
+                              juce::Colours::white);
+  resetOffsetButton.onClick = [this] {
+    processorRef.setStartOffsetSeconds(0.0);
+    updateSampleInfo();
+    waveformDisplay.repaint();
+  };
+  addAndMakeVisible(resetOffsetButton);
+
   // Sample name label
   sampleNameLabel.setFont(juce::Font(16.0f, juce::Font::bold));
   sampleNameLabel.setColour(juce::Label::textColourId, juce::Colours::white);
@@ -50,23 +62,31 @@ BackingTrackTriggerEditor::BackingTrackTriggerEditor(
   hostInfoLabel.setJustificationType(juce::Justification::centredRight);
   addAndMakeVisible(hostInfoLabel);
 
+  // Offset label
+  offsetLabel.setFont(juce::Font(12.0f, juce::Font::bold));
+  offsetLabel.setColour(juce::Label::textColourId, juce::Colour(0xff00ff00));
+  offsetLabel.setJustificationType(juce::Justification::centred);
+  addAndMakeVisible(offsetLabel);
+
   // Instruction label
-  instructionLabel.setText("Any MIDI note triggers playback. Note-off stops.",
-                           juce::dontSendNotification);
-  instructionLabel.setFont(juce::Font(12.0f, juce::Font::italic));
+  instructionLabel.setText(
+      "MIDI Note-On triggers playback. Sample plays to completion.",
+      juce::dontSendNotification);
+  instructionLabel.setFont(juce::Font(11.0f, juce::Font::italic));
   instructionLabel.setColour(juce::Label::textColourId,
                              juce::Colour(0xff888888));
   instructionLabel.setJustificationType(juce::Justification::centred);
   addAndMakeVisible(instructionLabel);
 
-  // Waveform display
+  // Waveform display - set callback for offset changes
+  waveformDisplay.onOffsetChanged = [this] { updateSampleInfo(); };
   addAndMakeVisible(waveformDisplay);
 
   // Update display with current sample info
   updateSampleInfo();
 
-  // Set the editor size (a bit taller to fit new info)
-  setSize(500, 340);
+  // Set the editor size - LARGER to accommodate bigger waveform
+  setSize(600, 420);
 }
 
 BackingTrackTriggerEditor::~BackingTrackTriggerEditor() {}
@@ -82,14 +102,14 @@ void BackingTrackTriggerEditor::paint(juce::Graphics &g) {
 
   // Title
   g.setColour(juce::Colours::white);
-  g.setFont(juce::Font(22.0f, juce::Font::bold));
-  g.drawText("Backing Track Trigger", 20, 10, getWidth() - 40, 30,
+  g.setFont(juce::Font(24.0f, juce::Font::bold));
+  g.drawText("Backing Track Trigger", 20, 10, getWidth() - 40, 35,
              juce::Justification::centred);
 
   // Subtitle
   g.setColour(juce::Colour(0xff00d9ff));
   g.setFont(juce::Font(12.0f));
-  g.drawText("One-Shot Sample Player for MuseScore", 20, 35, getWidth() - 40,
+  g.drawText("One-Shot Sample Player for MuseScore", 20, 40, getWidth() - 40,
              20, juce::Justification::centred);
 }
 
@@ -97,11 +117,11 @@ void BackingTrackTriggerEditor::resized() {
   auto area = getLocalBounds().reduced(20);
 
   // Reserve top space for title
-  area.removeFromTop(60);
+  area.removeFromTop(65);
 
   // Sample info row (filename and duration)
   auto infoRow = area.removeFromTop(25);
-  sampleNameLabel.setBounds(infoRow.removeFromLeft(infoRow.getWidth() / 2));
+  sampleNameLabel.setBounds(infoRow.removeFromLeft(infoRow.getWidth() * 2 / 3));
   durationLabel.setBounds(infoRow);
 
   area.removeFromTop(5);
@@ -115,20 +135,27 @@ void BackingTrackTriggerEditor::resized() {
 
   area.removeFromTop(8);
 
-  // Waveform display
-  waveformDisplay.setBounds(area.removeFromTop(120));
+  // Waveform display - LARGER
+  waveformDisplay.setBounds(area.removeFromTop(180));
 
-  area.removeFromTop(15);
+  area.removeFromTop(8);
 
-  // Button row
+  // Offset display
+  offsetLabel.setBounds(area.removeFromTop(20));
+
+  area.removeFromTop(10);
+
+  // Button row - 4 buttons now
   auto buttonRow = area.removeFromTop(40);
-  int buttonWidth = (buttonRow.getWidth() - 20) / 3;
+  int buttonWidth = (buttonRow.getWidth() - 30) / 4;
 
   loadButton.setBounds(buttonRow.removeFromLeft(buttonWidth));
   buttonRow.removeFromLeft(10);
   playButton.setBounds(buttonRow.removeFromLeft(buttonWidth));
   buttonRow.removeFromLeft(10);
-  stopButton.setBounds(buttonRow);
+  stopButton.setBounds(buttonRow.removeFromLeft(buttonWidth));
+  buttonRow.removeFromLeft(10);
+  resetOffsetButton.setBounds(buttonRow);
 
   area.removeFromTop(10);
 
@@ -191,10 +218,32 @@ void BackingTrackTriggerEditor::updateSampleInfo() {
     }
     hostInfoLabel.setText(hostInfo, juce::dontSendNotification);
 
+    // Start offset display
+    double offsetSec = processorRef.getStartOffsetSeconds();
+    if (offsetSec > 0.001) {
+      int offsetMs = static_cast<int>(offsetSec * 1000);
+      if (offsetSec >= 1.0) {
+        int offsetMins = static_cast<int>(offsetSec) / 60;
+        int offsetSecs = static_cast<int>(offsetSec) % 60;
+        offsetLabel.setText(
+            juce::String::formatted("Start Offset: %d:%02d.%03d", offsetMins,
+                                    offsetSecs, offsetMs % 1000),
+            juce::dontSendNotification);
+      } else {
+        offsetLabel.setText(
+            juce::String::formatted("Start Offset: %d ms", offsetMs),
+            juce::dontSendNotification);
+      }
+    } else {
+      offsetLabel.setText("Start Offset: 0 (click waveform to set)",
+                          juce::dontSendNotification);
+    }
+
   } else {
     sampleNameLabel.setText("No sample loaded", juce::dontSendNotification);
     durationLabel.setText("--:--", juce::dontSendNotification);
     fileInfoLabel.setText("", juce::dontSendNotification);
+    offsetLabel.setText("", juce::dontSendNotification);
 
     // Still show host sample rate even without a sample
     juce::String hostInfo = juce::String::formatted(

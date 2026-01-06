@@ -8,11 +8,12 @@
  * BackingTrackTrigger - A one-shot sampler for playing backing tracks
  *
  * This plugin loads a WAV file and plays it when any MIDI note is received.
- * - Any MIDI Note-On: Starts/restarts playback from beginning
- * - Any MIDI Note-Off: Stops playback
+ * - Any MIDI Note-On: Starts playback from start offset position
+ * - Note-Off is IGNORED - sample plays to completion
  * - No pitch shifting: all notes play at original sample pitch
  * - Automatic resampling to match host sample rate
  * - Syncs with host transport (resets when host stops/rewinds)
+ * - Adjustable start offset to skip silence at beginning
  */
 class BackingTrackTriggerProcessor : public juce::AudioProcessor {
 public:
@@ -75,6 +76,12 @@ public:
   double getHostSampleRate() const { return currentSampleRate; }
   bool isResampled() const { return wasResampled; }
 
+  // Start offset control (in seconds)
+  void setStartOffsetSeconds(double offsetSeconds);
+  double getStartOffsetSeconds() const;
+  void setStartOffsetFromProgress(
+      float progress); // Set offset from waveform click position
+
 private:
   //==============================================================================
   void resampleBufferHighQuality(double sourceSampleRate,
@@ -94,6 +101,9 @@ private:
   std::atomic<bool> playing{false};
   std::atomic<bool> triggered{false}; // True only when triggered by MIDI note
   std::atomic<int64_t> playbackPosition{0};
+
+  // Start offset (in samples, after resampling)
+  std::atomic<int64_t> startOffsetSamples{0};
 
   // Host transport tracking
   int64_t lastHostPosition = 0;

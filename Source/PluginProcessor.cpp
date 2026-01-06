@@ -126,7 +126,8 @@ void BackingTrackTriggerProcessor::processBlock(
     }
   }
 
-  // Process MIDI messages - ONLY trigger on explicit note events
+  // Process MIDI messages - ONLY trigger on note-on events
+  // NOTE-OFF IS IGNORED - sample plays to completion!
   for (const auto metadata : midiMessages) {
     auto message = metadata.getMessage();
 
@@ -134,11 +135,8 @@ void BackingTrackTriggerProcessor::processBlock(
       // Only actual note-on with velocity > 0 triggers playback
       startPlayback();
       triggered = true;
-    } else if (message.isNoteOff() ||
-               (message.isNoteOn() && message.getVelocity() == 0)) {
-      // Note-off (or note-on with velocity 0) stops playback
-      stopPlayback();
     }
+    // Note-off is intentionally IGNORED - sample plays until it finishes
   }
 
   // Only play if we were explicitly triggered by a MIDI note AND we're playing
@@ -154,7 +152,7 @@ void BackingTrackTriggerProcessor::processBlock(
   if (currentPos >= sampleLength) {
     playing = false;
     triggered = false;
-    playbackPosition = 0;
+    playbackPosition = startOffsetSamples.load(); // Reset to start offset
     return;
   }
 
@@ -181,7 +179,7 @@ void BackingTrackTriggerProcessor::processBlock(
   if (playbackPosition >= sampleLength) {
     playing = false;
     triggered = false;
-    playbackPosition = 0;
+    playbackPosition = startOffsetSamples.load(); // Reset to start offset
   }
 }
 
@@ -195,9 +193,10 @@ juce::AudioProcessorEditor *BackingTrackTriggerProcessor::createEditor() {
 //==============================================================================
 void BackingTrackTriggerProcessor::getStateInformation(
     juce::MemoryBlock &destData) {
-  // Save the loaded sample path
+  // Save the loaded sample path and start offset
   juce::MemoryOutputStream stream(destData, true);
   stream.writeString(loadedSampleName);
+  stream.writeDouble(getStartOffsetSeconds());
 }
 
 void BackingTrackTriggerProcessor::setStateInformation(const void *data,
@@ -205,16 +204,53 @@ void BackingTrackTriggerProcessor::setStateInformation(const void *data,
   // Restore sample from saved state
   juce::MemoryInputStream stream(data, static_cast<size_t>(sizeInBytes), false);
   juce::String samplePath = stream.readString();
+  double savedOffset = 0.0;
+  if (!stream.isExhausted()) {
+    savedOffset = stream.readDouble();
+  }
 
   if (samplePath.isNotEmpty()) {
     juce::File file(samplePath);
-    if (file.existsAsFile())
+    if (file.existsAsFile()) {
       loadSample(file);
+      setStartOffsetSeconds(savedOffset);
+    }
   }
 }
 
 //==============================================================================
-// High-quality resampling using windowed sinc interpolation
+// Start offset control
+void BackingTrackTriggerProcessor::setStartOffsetSeconds(double offsetSeconds) {
+  if (currentSampleRate > 0) {
+    int64_t offsetSamples =
+        static_cast<int64_t>(offsetSeconds * currentSampleRate);
+    // Clamp to valid range
+    offsetSamples =
+        std::max(int64_t(0),
+                 std::min(offsetSamples,
+                          static_cast<int64_t>(sampleBuffer.getNumSamples())));
+    startOffsetSamples = offsetSamples;
+  }
+}
+
+double BackingTrackTriggerProcessor::getStartOffsetSeconds() const {
+  if (currentSampleRate > 0) {
+    return static_cast<double>(startOffsetSamples.load()) / currentSampleRate;
+  }
+  return 0.0;
+}
+
+void BackingTrackTriggerProcessor::setStartOffsetFromProgress(float progress) {
+  if (sampleBuffer.getNumSamples() > 0) {
+    progress = std::max(0.0f, std::min(1.0f, progress));
+    int64_t offsetSamples =
+        static_cast<int64_t>(progress * sampleBuffer.getNumSamples());
+    startOffsetSamples = offsetSamples;
+  }
+}
+
+//==============================================================================
+// High-quality resampling using cubic Hermite interpolation
 void BackingTrackTriggerProcessor::resampleBufferHighQuality(
     double sourceSampleRate, double targetSampleRate) {
   if (sourceSampleRate == targetSampleRate || sampleBuffer.getNumSamples() == 0)
@@ -272,6 +308,7 @@ void BackingTrackTriggerProcessor::loadSample(const juce::File &file) {
   stopPlayback();
   triggered = false;
   wasResampled = false;
+  startOffsetSamples = 0;
 
   // Try to load the audio file
   std::unique_ptr<juce::AudioFormatReader> reader(
@@ -318,7 +355,7 @@ void BackingTrackTriggerProcessor::loadSample(const juce::File &file) {
 
 void BackingTrackTriggerProcessor::startPlayback() {
   if (sampleBuffer.getNumSamples() > 0) {
-    playbackPosition = 0;
+    playbackPosition = startOffsetSamples.load(); // Start from offset
     playing = true;
     triggered = true;
   }
@@ -327,13 +364,13 @@ void BackingTrackTriggerProcessor::startPlayback() {
 void BackingTrackTriggerProcessor::stopPlayback() {
   playing = false;
   triggered = false;
-  playbackPosition = 0;
+  playbackPosition = startOffsetSamples.load(); // Reset to start offset
 }
 
 void BackingTrackTriggerProcessor::resetPlayback() {
   playing = false;
   triggered = false;
-  playbackPosition = 0;
+  playbackPosition = startOffsetSamples.load(); // Reset to start offset
 }
 
 double BackingTrackTriggerProcessor::getSampleLengthSeconds() const {

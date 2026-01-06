@@ -5,6 +5,7 @@
 //==============================================================================
 /**
  * Waveform display component showing the loaded sample
+ * Click on the waveform to set the start offset position
  */
 class WaveformDisplay : public juce::Component, public juce::Timer {
 public:
@@ -29,12 +30,13 @@ public:
       // No sample loaded - show placeholder
       g.setColour(juce::Colours::grey);
       g.setFont(16.0f);
-      g.drawText("No sample loaded", bounds, juce::Justification::centred);
+      g.drawText("No sample loaded - Click 'Load Sample' to begin", bounds,
+                 juce::Justification::centred);
       return;
     }
 
     // Draw waveform
-    auto waveformBounds = bounds.reduced(10.0f, 20.0f);
+    auto waveformBounds = bounds.reduced(10.0f, 15.0f);
     float midY = waveformBounds.getCentreY();
     float height = waveformBounds.getHeight() / 2.0f;
 
@@ -86,7 +88,26 @@ public:
     waveformPath.closeSubPath();
     g.fillPath(waveformPath);
 
-    // Draw playback position line
+    // Draw start offset marker (green line)
+    float startOffset = static_cast<float>(processor.getStartOffsetSeconds() *
+                                           processor.getHostSampleRate()) /
+                        numSamples;
+    if (startOffset > 0.0f && startOffset < 1.0f) {
+      float offsetX =
+          waveformBounds.getX() + startOffset * waveformBounds.getWidth();
+      g.setColour(juce::Colour(0xff00ff00)); // Bright green
+      g.drawLine(offsetX, waveformBounds.getY(), offsetX,
+                 waveformBounds.getBottom(), 3.0f);
+
+      // Draw small triangle at top
+      juce::Path triangle;
+      triangle.addTriangle(offsetX - 6, waveformBounds.getY(), offsetX + 6,
+                           waveformBounds.getY(), offsetX,
+                           waveformBounds.getY() + 10);
+      g.fillPath(triangle);
+    }
+
+    // Draw playback position line (white)
     if (processor.isPlaying()) {
       float progress = processor.getPlaybackProgress();
       float lineX =
@@ -96,6 +117,12 @@ public:
       g.drawLine(lineX, waveformBounds.getY(), lineX,
                  waveformBounds.getBottom(), 2.0f);
     }
+
+    // Draw instruction text at bottom
+    g.setColour(juce::Colour(0xff666666));
+    g.setFont(10.0f);
+    g.drawText("Click to set start position", bounds.removeFromBottom(15),
+               juce::Justification::centred);
   }
 
   void timerCallback() override {
@@ -103,13 +130,32 @@ public:
       repaint();
   }
 
+  void mouseDown(const juce::MouseEvent &event) override {
+    if (processor.hasSampleLoaded()) {
+      auto bounds = getLocalBounds().toFloat().reduced(10.0f, 15.0f);
+      float clickX = static_cast<float>(event.x);
+      float progress = (clickX - bounds.getX()) / bounds.getWidth();
+      progress = std::max(0.0f, std::min(1.0f, progress));
+
+      processor.setStartOffsetFromProgress(progress);
+      repaint();
+
+      // Notify parent to update offset display
+      if (onOffsetChanged)
+        onOffsetChanged();
+    }
+  }
+
+  std::function<void()> onOffsetChanged;
+
 private:
   BackingTrackTriggerProcessor &processor;
 };
 
 //==============================================================================
 /**
- * Plugin editor with file browser, waveform display, and file info
+ * Plugin editor with file browser, large waveform display, and start offset
+ * control
  */
 class BackingTrackTriggerEditor : public juce::AudioProcessorEditor {
 public:
@@ -126,10 +172,12 @@ private:
   juce::TextButton loadButton{"Load Sample"};
   juce::TextButton playButton{"Play"};
   juce::TextButton stopButton{"Stop"};
+  juce::TextButton resetOffsetButton{"Reset Start"};
   juce::Label sampleNameLabel;
   juce::Label durationLabel;
   juce::Label fileInfoLabel; // Shows sample rate, channels, bit depth
   juce::Label hostInfoLabel; // Shows host sample rate & resampling status
+  juce::Label offsetLabel;   // Shows current start offset
   juce::Label instructionLabel;
   WaveformDisplay waveformDisplay;
 
