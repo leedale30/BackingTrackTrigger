@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(BackingTrackTrigger VERSION 1.0.0)
+project(BackingTrackTrigger VERSION 1.1.0)
 
 # Add JUCE as a subdirectory
 add_subdirectory(JUCE)

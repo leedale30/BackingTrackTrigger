@@ -106,11 +106,11 @@ void BackingTrackTriggerEditor::paint(juce::Graphics &g) {
   g.drawText("Backing Track Trigger", 20, 10, getWidth() - 40, 35,
              juce::Justification::centred);
 
-  // Subtitle
+  // Subtitle with version
   g.setColour(juce::Colour(0xff00d9ff));
   g.setFont(juce::Font(12.0f));
-  g.drawText("One-Shot Sample Player for MuseScore", 20, 40, getWidth() - 40,
-             20, juce::Justification::centred);
+  g.drawText("One-Shot Sample Player for MuseScore  |  v1.1.0", 20, 40,
+             getWidth() - 40, 20, juce::Justification::centred);
 }
 
 void BackingTrackTriggerEditor::resized() {
