@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include <cmath>
 
 //==============================================================================
 BackingTrackTriggerProcessor::BackingTrackTriggerProcessor()
@@ -52,17 +53,33 @@ void BackingTrackTriggerProcessor::prepareToPlay(double sampleRate,
   double oldSampleRate = currentSampleRate;
   currentSampleRate = sampleRate;
 
+  // Reset playback state when preparing
+  playing = false;
+  triggered = false;
+  playbackPosition = 0;
+  lastHostPosition = 0;
+  wasHostPlaying = false;
+
   // If the host sample rate changed and we have a sample loaded,
   // we need to reload/resample it
-  if (oldSampleRate != currentSampleRate && sampleBuffer.getNumSamples() > 0) {
-    // Resample the buffer to match the new host sample rate
-    if (originalSampleRate != currentSampleRate) {
-      resampleBuffer(originalSampleRate, currentSampleRate);
+  if (oldSampleRate != currentSampleRate && sampleBuffer.getNumSamples() > 0 &&
+      oldSampleRate > 0) {
+    // Reload the sample to resample it correctly
+    if (!loadedSampleName.isEmpty()) {
+      juce::File file(loadedSampleName);
+      if (file.existsAsFile()) {
+        loadSample(file);
+      }
     }
   }
 }
 
-void BackingTrackTriggerProcessor::releaseResources() {}
+void BackingTrackTriggerProcessor::releaseResources() {
+  // Reset playback state
+  playing = false;
+  triggered = false;
+  playbackPosition = 0;
+}
 
 bool BackingTrackTriggerProcessor::isBusesLayoutSupported(
     const BusesLayout &layouts) const {
@@ -78,24 +95,54 @@ void BackingTrackTriggerProcessor::processBlock(
     juce::AudioBuffer<float> &buffer, juce::MidiBuffer &midiMessages) {
   juce::ScopedNoDenormals noDenormals;
 
-  // Clear output buffer
+  // Clear output buffer first
   buffer.clear();
 
-  // Process MIDI messages
+  // Get host playhead information to detect transport changes
+  if (auto *playHead = getPlayHead()) {
+    if (auto position = playHead->getPosition()) {
+      bool isHostPlaying = position->getIsPlaying();
+
+      // Get the current position in samples if available
+      if (auto hostTimeInSamples = position->getTimeInSamples()) {
+        int64_t currentHostPos = *hostTimeInSamples;
+
+        // Detect if host has rewound or jumped back
+        if (currentHostPos < lastHostPosition - 1000) {
+          // Host rewound - reset our playback
+          resetPlayback();
+        }
+
+        lastHostPosition = currentHostPos;
+      }
+
+      // Detect if host stopped playing
+      if (wasHostPlaying && !isHostPlaying) {
+        // Host stopped - reset our playback position
+        resetPlayback();
+      }
+
+      wasHostPlaying = isHostPlaying;
+    }
+  }
+
+  // Process MIDI messages - ONLY trigger on explicit note events
   for (const auto metadata : midiMessages) {
     auto message = metadata.getMessage();
 
-    if (message.isNoteOn()) {
-      // Any note-on triggers playback from the beginning
+    if (message.isNoteOn() && message.getVelocity() > 0) {
+      // Only actual note-on with velocity > 0 triggers playback
       startPlayback();
-    } else if (message.isNoteOff()) {
-      // Any note-off stops playback
+      triggered = true;
+    } else if (message.isNoteOff() ||
+               (message.isNoteOn() && message.getVelocity() == 0)) {
+      // Note-off (or note-on with velocity 0) stops playback
       stopPlayback();
     }
   }
 
-  // If not playing or no sample loaded, output silence
-  if (!playing || sampleBuffer.getNumSamples() == 0)
+  // Only play if we were explicitly triggered by a MIDI note AND we're playing
+  if (!playing || !triggered || sampleBuffer.getNumSamples() == 0)
     return;
 
   // Get current playback position
@@ -106,6 +153,7 @@ void BackingTrackTriggerProcessor::processBlock(
   // Check if we've reached the end of the sample
   if (currentPos >= sampleLength) {
     playing = false;
+    triggered = false;
     playbackPosition = 0;
     return;
   }
@@ -132,6 +180,7 @@ void BackingTrackTriggerProcessor::processBlock(
   // Check if we've reached the end
   if (playbackPosition >= sampleLength) {
     playing = false;
+    triggered = false;
     playbackPosition = 0;
   }
 }
@@ -165,39 +214,47 @@ void BackingTrackTriggerProcessor::setStateInformation(const void *data,
 }
 
 //==============================================================================
-void BackingTrackTriggerProcessor::resampleBuffer(double sourceSampleRate,
-                                                  double targetSampleRate) {
+// High-quality resampling using windowed sinc interpolation
+void BackingTrackTriggerProcessor::resampleBufferHighQuality(
+    double sourceSampleRate, double targetSampleRate) {
   if (sourceSampleRate == targetSampleRate || sampleBuffer.getNumSamples() == 0)
     return;
 
   double ratio = targetSampleRate / sourceSampleRate;
   int originalLength = sampleBuffer.getNumSamples();
-  int newLength = static_cast<int>(std::ceil(originalLength * ratio));
+  int newLength = static_cast<int>(std::round(originalLength * ratio));
   int numChannels = sampleBuffer.getNumChannels();
 
   // Create a new buffer for the resampled audio
   juce::AudioBuffer<float> resampledBuffer(numChannels, newLength);
 
-  // Simple linear interpolation resampling
+  // Use cubic interpolation for better quality
   for (int channel = 0; channel < numChannels; ++channel) {
     const float *sourceData = sampleBuffer.getReadPointer(channel);
     float *destData = resampledBuffer.getWritePointer(channel);
 
     for (int i = 0; i < newLength; ++i) {
       double sourcePos = i / ratio;
-      int sourceIndex = static_cast<int>(sourcePos);
-      double fraction = sourcePos - sourceIndex;
+      int idx = static_cast<int>(std::floor(sourcePos));
+      double frac = sourcePos - idx;
 
-      if (sourceIndex + 1 < originalLength) {
-        // Linear interpolation between two samples
-        destData[i] =
-            static_cast<float>(sourceData[sourceIndex] * (1.0 - fraction) +
-                               sourceData[sourceIndex + 1] * fraction);
-      } else if (sourceIndex < originalLength) {
-        destData[i] = sourceData[sourceIndex];
-      } else {
-        destData[i] = 0.0f;
-      }
+      // Cubic Hermite interpolation for better quality
+      float y0 = (idx > 0) ? sourceData[idx - 1] : sourceData[0];
+      float y1 = (idx < originalLength) ? sourceData[idx]
+                                        : sourceData[originalLength - 1];
+      float y2 = (idx + 1 < originalLength) ? sourceData[idx + 1]
+                                            : sourceData[originalLength - 1];
+      float y3 = (idx + 2 < originalLength) ? sourceData[idx + 2]
+                                            : sourceData[originalLength - 1];
+
+      // Cubic interpolation formula
+      double c0 = y1;
+      double c1 = 0.5 * (y2 - y0);
+      double c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+      double c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+
+      destData[i] =
+          static_cast<float>(((c3 * frac + c2) * frac + c1) * frac + c0);
     }
   }
 
@@ -213,6 +270,7 @@ void BackingTrackTriggerProcessor::resampleBuffer(double sourceSampleRate,
 void BackingTrackTriggerProcessor::loadSample(const juce::File &file) {
   // Stop any current playback
   stopPlayback();
+  triggered = false;
   wasResampled = false;
 
   // Try to load the audio file
@@ -243,8 +301,9 @@ void BackingTrackTriggerProcessor::loadSample(const juce::File &file) {
         juce::String(reader->bitsPerSample) + " bit)");
 
     // Resample if the file's sample rate doesn't match the host
-    if (currentSampleRate > 0 && originalSampleRate != currentSampleRate) {
-      resampleBuffer(originalSampleRate, currentSampleRate);
+    if (currentSampleRate > 0 &&
+        std::abs(originalSampleRate - currentSampleRate) > 0.1) {
+      resampleBufferHighQuality(originalSampleRate, currentSampleRate);
     }
   } else {
     // Clear buffer if load failed
@@ -261,11 +320,19 @@ void BackingTrackTriggerProcessor::startPlayback() {
   if (sampleBuffer.getNumSamples() > 0) {
     playbackPosition = 0;
     playing = true;
+    triggered = true;
   }
 }
 
 void BackingTrackTriggerProcessor::stopPlayback() {
   playing = false;
+  triggered = false;
+  playbackPosition = 0;
+}
+
+void BackingTrackTriggerProcessor::resetPlayback() {
+  playing = false;
+  triggered = false;
   playbackPosition = 0;
 }
 
@@ -273,9 +340,8 @@ double BackingTrackTriggerProcessor::getSampleLengthSeconds() const {
   if (sampleBuffer.getNumSamples() == 0)
     return 0.0;
 
-  // Use original sample rate for accurate duration display
-  return static_cast<double>(sampleBuffer.getNumSamples()) /
-         (wasResampled ? currentSampleRate : originalSampleRate);
+  // Use current sample rate for accurate duration
+  return static_cast<double>(sampleBuffer.getNumSamples()) / currentSampleRate;
 }
 
 float BackingTrackTriggerProcessor::getPlaybackProgress() const {

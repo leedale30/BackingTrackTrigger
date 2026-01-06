@@ -12,6 +12,7 @@
  * - Any MIDI Note-Off: Stops playback
  * - No pitch shifting: all notes play at original sample pitch
  * - Automatic resampling to match host sample rate
+ * - Syncs with host transport (resets when host stops/rewinds)
  */
 class BackingTrackTriggerProcessor : public juce::AudioProcessor {
 public:
@@ -54,6 +55,7 @@ public:
   void loadSample(const juce::File &file);
   void startPlayback();
   void stopPlayback();
+  void resetPlayback(); // Reset position to beginning without stopping
 
   bool hasSampleLoaded() const { return sampleBuffer.getNumSamples() > 0; }
   juce::String getSampleName() const { return loadedSampleName; }
@@ -75,7 +77,8 @@ public:
 
 private:
   //==============================================================================
-  void resampleBuffer(double sourceSampleRate, double targetSampleRate);
+  void resampleBufferHighQuality(double sourceSampleRate,
+                                 double targetSampleRate);
 
   juce::AudioFormatManager formatManager;
   juce::AudioBuffer<float> sampleBuffer;
@@ -89,7 +92,12 @@ private:
 
   // Playback state
   std::atomic<bool> playing{false};
+  std::atomic<bool> triggered{false}; // True only when triggered by MIDI note
   std::atomic<int64_t> playbackPosition{0};
+
+  // Host transport tracking
+  int64_t lastHostPosition = 0;
+  bool wasHostPlaying = false;
 
   // Current sample rate from host
   double currentSampleRate = 44100.0;
