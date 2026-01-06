@@ -109,7 +109,7 @@ private:
 
 //==============================================================================
 /**
- * Plugin editor with file browser and waveform display
+ * Plugin editor with file browser, waveform display, and file info
  */
 class BackingTrackTriggerEditor : public juce::AudioProcessorEditor {
 public:
@@ -128,6 +128,8 @@ private:
   juce::TextButton stopButton{"Stop"};
   juce::Label sampleNameLabel;
   juce::Label durationLabel;
+  juce::Label fileInfoLabel; // Shows sample rate, channels, bit depth
+  juce::Label hostInfoLabel; // Shows host sample rate & resampling status
   juce::Label instructionLabel;
   WaveformDisplay waveformDisplay;
 

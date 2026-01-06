@@ -5,7 +5,7 @@
 BackingTrackTriggerProcessor::BackingTrackTriggerProcessor()
     : AudioProcessor(BusesProperties().withOutput(
           "Output", juce::AudioChannelSet::stereo(), true)) {
-  // Register audio formats we can load (WAV, AIFF, etc.)
+  // Register audio formats we can load (WAV, AIFF, MP3, etc.)
   formatManager.registerBasicFormats();
 }
 
@@ -48,7 +48,18 @@ void BackingTrackTriggerProcessor::changeProgramName(
 void BackingTrackTriggerProcessor::prepareToPlay(double sampleRate,
                                                  int samplesPerBlock) {
   juce::ignoreUnused(samplesPerBlock);
+
+  double oldSampleRate = currentSampleRate;
   currentSampleRate = sampleRate;
+
+  // If the host sample rate changed and we have a sample loaded,
+  // we need to reload/resample it
+  if (oldSampleRate != currentSampleRate && sampleBuffer.getNumSamples() > 0) {
+    // Resample the buffer to match the new host sample rate
+    if (originalSampleRate != currentSampleRate) {
+      resampleBuffer(originalSampleRate, currentSampleRate);
+    }
+  }
 }
 
 void BackingTrackTriggerProcessor::releaseResources() {}
@@ -154,15 +165,66 @@ void BackingTrackTriggerProcessor::setStateInformation(const void *data,
 }
 
 //==============================================================================
+void BackingTrackTriggerProcessor::resampleBuffer(double sourceSampleRate,
+                                                  double targetSampleRate) {
+  if (sourceSampleRate == targetSampleRate || sampleBuffer.getNumSamples() == 0)
+    return;
+
+  double ratio = targetSampleRate / sourceSampleRate;
+  int originalLength = sampleBuffer.getNumSamples();
+  int newLength = static_cast<int>(std::ceil(originalLength * ratio));
+  int numChannels = sampleBuffer.getNumChannels();
+
+  // Create a new buffer for the resampled audio
+  juce::AudioBuffer<float> resampledBuffer(numChannels, newLength);
+
+  // Simple linear interpolation resampling
+  for (int channel = 0; channel < numChannels; ++channel) {
+    const float *sourceData = sampleBuffer.getReadPointer(channel);
+    float *destData = resampledBuffer.getWritePointer(channel);
+
+    for (int i = 0; i < newLength; ++i) {
+      double sourcePos = i / ratio;
+      int sourceIndex = static_cast<int>(sourcePos);
+      double fraction = sourcePos - sourceIndex;
+
+      if (sourceIndex + 1 < originalLength) {
+        // Linear interpolation between two samples
+        destData[i] =
+            static_cast<float>(sourceData[sourceIndex] * (1.0 - fraction) +
+                               sourceData[sourceIndex + 1] * fraction);
+      } else if (sourceIndex < originalLength) {
+        destData[i] = sourceData[sourceIndex];
+      } else {
+        destData[i] = 0.0f;
+      }
+    }
+  }
+
+  // Replace the original buffer with the resampled one
+  sampleBuffer = std::move(resampledBuffer);
+  wasResampled = true;
+
+  DBG("Resampled from " + juce::String(sourceSampleRate) + " Hz to " +
+      juce::String(targetSampleRate) + " Hz (" + juce::String(originalLength) +
+      " -> " + juce::String(newLength) + " samples)");
+}
+
 void BackingTrackTriggerProcessor::loadSample(const juce::File &file) {
   // Stop any current playback
   stopPlayback();
+  wasResampled = false;
 
   // Try to load the audio file
   std::unique_ptr<juce::AudioFormatReader> reader(
       formatManager.createReaderFor(file));
 
   if (reader != nullptr) {
+    // Store original file info
+    originalSampleRate = reader->sampleRate;
+    originalNumChannels = static_cast<int>(reader->numChannels);
+    originalBitsPerSample = static_cast<int>(reader->bitsPerSample);
+
     // Allocate buffer for the entire sample
     sampleBuffer.setSize(static_cast<int>(reader->numChannels),
                          static_cast<int>(reader->lengthInSamples));
@@ -173,16 +235,24 @@ void BackingTrackTriggerProcessor::loadSample(const juce::File &file) {
 
     // Store sample info
     loadedSampleName = file.getFullPathName();
-    loadedSampleRate = reader->sampleRate;
 
     DBG("Loaded sample: " + file.getFileName() + " (" +
         juce::String(reader->lengthInSamples) + " samples, " +
         juce::String(reader->numChannels) + " channels, " +
-        juce::String(reader->sampleRate) + " Hz)");
+        juce::String(reader->sampleRate) + " Hz, " +
+        juce::String(reader->bitsPerSample) + " bit)");
+
+    // Resample if the file's sample rate doesn't match the host
+    if (currentSampleRate > 0 && originalSampleRate != currentSampleRate) {
+      resampleBuffer(originalSampleRate, currentSampleRate);
+    }
   } else {
     // Clear buffer if load failed
     sampleBuffer.setSize(0, 0);
     loadedSampleName = "";
+    originalSampleRate = 44100.0;
+    originalNumChannels = 2;
+    originalBitsPerSample = 16;
     DBG("Failed to load sample: " + file.getFullPathName());
   }
 }
@@ -203,7 +273,9 @@ double BackingTrackTriggerProcessor::getSampleLengthSeconds() const {
   if (sampleBuffer.getNumSamples() == 0)
     return 0.0;
 
-  return static_cast<double>(sampleBuffer.getNumSamples()) / loadedSampleRate;
+  // Use original sample rate for accurate duration display
+  return static_cast<double>(sampleBuffer.getNumSamples()) /
+         (wasResampled ? currentSampleRate : originalSampleRate);
 }
 
 float BackingTrackTriggerProcessor::getPlaybackProgress() const {

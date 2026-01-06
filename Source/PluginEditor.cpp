@@ -38,6 +38,18 @@ BackingTrackTriggerEditor::BackingTrackTriggerEditor(
   durationLabel.setJustificationType(juce::Justification::centredRight);
   addAndMakeVisible(durationLabel);
 
+  // File info label (sample rate, channels, bit depth)
+  fileInfoLabel.setFont(juce::Font(11.0f));
+  fileInfoLabel.setColour(juce::Label::textColourId, juce::Colour(0xff00d9ff));
+  fileInfoLabel.setJustificationType(juce::Justification::centredLeft);
+  addAndMakeVisible(fileInfoLabel);
+
+  // Host info label (host sample rate, resampling status)
+  hostInfoLabel.setFont(juce::Font(11.0f));
+  hostInfoLabel.setColour(juce::Label::textColourId, juce::Colour(0xff88ff88));
+  hostInfoLabel.setJustificationType(juce::Justification::centredRight);
+  addAndMakeVisible(hostInfoLabel);
+
   // Instruction label
   instructionLabel.setText("Any MIDI note triggers playback. Note-off stops.",
                            juce::dontSendNotification);
@@ -53,8 +65,8 @@ BackingTrackTriggerEditor::BackingTrackTriggerEditor(
   // Update display with current sample info
   updateSampleInfo();
 
-  // Set the editor size
-  setSize(500, 300);
+  // Set the editor size (a bit taller to fit new info)
+  setSize(500, 340);
 }
 
 BackingTrackTriggerEditor::~BackingTrackTriggerEditor() {}
@@ -87,12 +99,21 @@ void BackingTrackTriggerEditor::resized() {
   // Reserve top space for title
   area.removeFromTop(60);
 
-  // Sample info row
+  // Sample info row (filename and duration)
   auto infoRow = area.removeFromTop(25);
   sampleNameLabel.setBounds(infoRow.removeFromLeft(infoRow.getWidth() / 2));
   durationLabel.setBounds(infoRow);
 
-  area.removeFromTop(10);
+  area.removeFromTop(5);
+
+  // File info row (sample rate, channels, bit depth on left; host info on
+  // right)
+  auto fileInfoRow = area.removeFromTop(18);
+  fileInfoLabel.setBounds(
+      fileInfoRow.removeFromLeft(fileInfoRow.getWidth() / 2));
+  hostInfoLabel.setBounds(fileInfoRow);
+
+  area.removeFromTop(8);
 
   // Waveform display
   waveformDisplay.setBounds(area.removeFromTop(120));
@@ -118,7 +139,7 @@ void BackingTrackTriggerEditor::resized() {
 //==============================================================================
 void BackingTrackTriggerEditor::loadButtonClicked() {
   fileChooser = std::make_unique<juce::FileChooser>(
-      "Select a WAV file to load...", juce::File{},
+      "Select an audio file to load...", juce::File{},
       "*.wav;*.aiff;*.aif;*.mp3;*.flac;*.ogg");
 
   auto fileChooserFlags = juce::FileBrowserComponent::openMode |
@@ -148,8 +169,38 @@ void BackingTrackTriggerEditor::updateSampleInfo() {
     int secs = static_cast<int>(seconds) % 60;
     durationLabel.setText(juce::String::formatted("%d:%02d", mins, secs),
                           juce::dontSendNotification);
+
+    // File info: original sample rate, channels, bit depth
+    juce::String channelStr =
+        (processorRef.getOriginalNumChannels() == 1) ? "Mono" : "Stereo";
+    juce::String fileInfo = juce::String::formatted(
+        "File: %.0f Hz | %s | %d-bit", processorRef.getOriginalSampleRate(),
+        channelStr.toRawUTF8(), processorRef.getOriginalBitsPerSample());
+    fileInfoLabel.setText(fileInfo, juce::dontSendNotification);
+
+    // Host info: host sample rate and resampling status
+    juce::String hostInfo = juce::String::formatted(
+        "Host: %.0f Hz", processorRef.getHostSampleRate());
+    if (processorRef.isResampled()) {
+      hostInfo += " (Resampled)";
+      hostInfoLabel.setColour(juce::Label::textColourId,
+                              juce::Colour(0xffffaa00)); // Orange if resampled
+    } else {
+      hostInfoLabel.setColour(juce::Label::textColourId,
+                              juce::Colour(0xff88ff88)); // Green if matched
+    }
+    hostInfoLabel.setText(hostInfo, juce::dontSendNotification);
+
   } else {
     sampleNameLabel.setText("No sample loaded", juce::dontSendNotification);
     durationLabel.setText("--:--", juce::dontSendNotification);
+    fileInfoLabel.setText("", juce::dontSendNotification);
+
+    // Still show host sample rate even without a sample
+    juce::String hostInfo = juce::String::formatted(
+        "Host: %.0f Hz", processorRef.getHostSampleRate());
+    hostInfoLabel.setColour(juce::Label::textColourId,
+                            juce::Colour(0xff88ff88));
+    hostInfoLabel.setText(hostInfo, juce::dontSendNotification);
   }
 }
