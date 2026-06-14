@@ -1,36 +1,273 @@
 #include "PluginEditor.h"
-#include "PluginProcessor.h"
+
+namespace {
+constexpr float kCornerRadius = 8.0f;
+const juce::Colour kAccent{0xff00d9ff};
+const juce::Colour kOffsetGreen{0xff00ff66};
+} // namespace
 
 //==============================================================================
+// WaveformDisplay
+//==============================================================================
+void WaveformDisplay::paint(juce::Graphics &g) {
+  auto bounds = getLocalBounds().toFloat();
+
+  g.setColour(juce::Colour(0xff1a1a2e));
+  g.fillRoundedRectangle(bounds, kCornerRadius);
+  g.setColour(fileBeingDragged ? kAccent : juce::Colour(0xff4a4a6a));
+  g.drawRoundedRectangle(bounds.reduced(1.0f), kCornerRadius,
+                         fileBeingDragged ? 3.0f : 2.0f);
+
+  auto sample = processor.getSample();
+  if (sample == nullptr || sample->audio.getNumSamples() == 0) {
+    g.setColour(juce::Colours::grey);
+    g.setFont(16.0f);
+    g.drawText(fileBeingDragged ? "Drop audio file to load"
+                                : "No sample - click Load or drop an audio file",
+               bounds, juce::Justification::centred);
+    return;
+  }
+
+  const auto &buffer = sample->audio;
+  const int numSamples = buffer.getNumSamples();
+
+  auto waveformBounds = bounds.reduced(10.0f, 15.0f);
+  const float midY = waveformBounds.getCentreY();
+  const float height = waveformBounds.getHeight() / 2.0f;
+
+  const int visibleSamples =
+      juce::jmax(1, static_cast<int>(static_cast<float>(numSamples) / zoomLevel));
+  const int startSampleView = static_cast<int>(
+      viewOffset * static_cast<float>(numSamples - visibleSamples));
+  const int endSampleView =
+      juce::jmin(startSampleView + visibleSamples, numSamples);
+  const float samplesPerPixel =
+      static_cast<float>(visibleSamples) / waveformBounds.getWidth();
+
+  juce::ColourGradient gradient(kAccent, waveformBounds.getX(), midY,
+                                juce::Colour(0xff0099ff),
+                                waveformBounds.getRight(), midY, false);
+  g.setGradientFill(gradient);
+
+  juce::Path waveformPath;
+  waveformPath.startNewSubPath(waveformBounds.getX(), midY);
+
+  auto peakAt = [&](float x) {
+    int startSample = startSampleView + static_cast<int>(x * samplesPerPixel);
+    int endSample = juce::jmin(
+        startSample + static_cast<int>(samplesPerPixel) + 1, numSamples);
+    float maxVal = 0.0f;
+    for (int s = startSample; s < endSample; ++s)
+      maxVal = juce::jmax(maxVal, std::abs(buffer.getSample(0, s)));
+    return maxVal;
+  };
+
+  for (float x = 0; x < waveformBounds.getWidth(); x += 1.0f)
+    waveformPath.lineTo(waveformBounds.getX() + x, midY - peakAt(x) * height);
+  for (float x = waveformBounds.getWidth() - 1; x >= 0; x -= 1.0f)
+    waveformPath.lineTo(waveformBounds.getX() + x, midY + peakAt(x) * height);
+
+  waveformPath.closeSubPath();
+  g.fillPath(waveformPath);
+
+  // Start-offset marker.
+  const double offsetSamples =
+      processor.getStartOffsetSeconds() * sample->playbackSampleRate;
+  if (offsetSamples >= startSampleView && offsetSamples < endSampleView) {
+    const float p = static_cast<float>(offsetSamples - startSampleView) /
+                    static_cast<float>(visibleSamples);
+    const float ox = waveformBounds.getX() + p * waveformBounds.getWidth();
+    g.setColour(kOffsetGreen);
+    g.drawLine(ox, waveformBounds.getY(), ox, waveformBounds.getBottom(), 3.0f);
+    juce::Path tri;
+    tri.addTriangle(ox - 6, waveformBounds.getY(), ox + 6,
+                    waveformBounds.getY(), ox, waveformBounds.getY() + 10);
+    g.fillPath(tri);
+  }
+
+  // Playback head.
+  if (processor.isPlaying()) {
+    const float playbackSample =
+        processor.getPlaybackProgress() * static_cast<float>(numSamples);
+    if (playbackSample >= static_cast<float>(startSampleView) &&
+        playbackSample < static_cast<float>(endSampleView)) {
+      const float p = (playbackSample - static_cast<float>(startSampleView)) /
+                      static_cast<float>(visibleSamples);
+      const float lx = waveformBounds.getX() + p * waveformBounds.getWidth();
+      g.setColour(juce::Colours::white);
+      g.drawLine(lx, waveformBounds.getY(), lx, waveformBounds.getBottom(),
+                 2.0f);
+    }
+  }
+
+  g.setColour(juce::Colour(0xff666666));
+  g.setFont(10.0f);
+  g.drawText(zoomLevel > 1.01f
+                 ? juce::String::formatted("Zoom %.0fx - click to set start",
+                                           zoomLevel)
+                 : juce::String("Click waveform to set start position"),
+             bounds.removeFromBottom(15), juce::Justification::centred);
+}
+
+void WaveformDisplay::timerCallback() {
+  if (processor.isPlaying())
+    repaint();
+}
+
+void WaveformDisplay::mouseDown(const juce::MouseEvent &event) {
+  auto sample = processor.getSample();
+  if (sample == nullptr || sample->audio.getNumSamples() == 0)
+    return;
+
+  auto wb = getLocalBounds().toFloat().reduced(10.0f, 15.0f);
+  float clickProgress = (static_cast<float>(event.x) - wb.getX()) / wb.getWidth();
+  clickProgress = juce::jlimit(0.0f, 1.0f, clickProgress);
+
+  const int numSamples = sample->audio.getNumSamples();
+  const int visibleSamples =
+      juce::jmax(1, static_cast<int>(static_cast<float>(numSamples) / zoomLevel));
+  const int startSampleView = static_cast<int>(
+      viewOffset * static_cast<float>(numSamples - visibleSamples));
+  const int clickedSample =
+      startSampleView +
+      static_cast<int>(clickProgress * static_cast<float>(visibleSamples));
+
+  processor.setStartOffsetFromProgress(static_cast<float>(clickedSample) /
+                                       static_cast<float>(numSamples));
+  repaint();
+  if (onOffsetChanged)
+    onOffsetChanged();
+}
+
+void WaveformDisplay::mouseWheelMove(const juce::MouseEvent &,
+                                     const juce::MouseWheelDetails &wheel) {
+  if (zoomLevel > 1.01f) {
+    viewOffset = juce::jlimit(0.0f, 1.0f, viewOffset - wheel.deltaY * 0.1f);
+    repaint();
+  }
+}
+
+bool WaveformDisplay::isInterestedInFileDrag(const juce::StringArray &files) {
+  for (const auto &f : files)
+    if (f.matchesWildcard("*.wav", true) || f.matchesWildcard("*.aif*", true) ||
+        f.matchesWildcard("*.mp3", true) || f.matchesWildcard("*.flac", true) ||
+        f.matchesWildcard("*.ogg", true))
+      return true;
+  return false;
+}
+
+void WaveformDisplay::fileDragEnter(const juce::StringArray &, int, int) {
+  fileBeingDragged = true;
+  repaint();
+}
+
+void WaveformDisplay::fileDragExit(const juce::StringArray &) {
+  fileBeingDragged = false;
+  repaint();
+}
+
+void WaveformDisplay::filesDropped(const juce::StringArray &files, int, int) {
+  fileBeingDragged = false;
+  repaint();
+  for (const auto &f : files) {
+    juce::File file(f);
+    if (file.existsAsFile() && onFileDropped) {
+      onFileDropped(file);
+      break;
+    }
+  }
+}
+
+void WaveformDisplay::setZoom(float newZoom) {
+  zoomLevel = juce::jlimit(1.0f, 200.0f, newZoom);
+  repaint();
+}
+
+void WaveformDisplay::setViewOffset(float offset) {
+  viewOffset = juce::jlimit(0.0f, 1.0f, offset);
+  repaint();
+}
+
+//==============================================================================
+// LevelMeter
+//==============================================================================
+void LevelMeter::paint(juce::Graphics &g) {
+  auto bounds = getLocalBounds().toFloat();
+  g.setColour(juce::Colour(0xff14141f));
+  g.fillRoundedRectangle(bounds, 3.0f);
+
+  const float clamped = juce::jlimit(0.0f, 1.0f, level);
+  if (clamped > 0.001f) {
+    auto fill = bounds.reduced(2.0f);
+    fill = fill.removeFromBottom(fill.getHeight() * clamped);
+    juce::ColourGradient grad(juce::Colour(0xff00ff66), 0, bounds.getBottom(),
+                              juce::Colour(0xffff3030), 0, bounds.getY(), false);
+    grad.addColour(0.7, juce::Colour(0xffffcc00));
+    g.setGradientFill(grad);
+    g.fillRoundedRectangle(fill, 2.0f);
+  }
+}
+
+void LevelMeter::timerCallback() {
+  const float target = processor.getOutputLevel();
+  level = target > level ? target : level * 0.8f; // fast attack, slow release
+  repaint();
+}
+
+//==============================================================================
+// Editor
+//==============================================================================
+void BackingTrackTriggerEditor::styleButton(juce::TextButton &b,
+                                            juce::Colour colour) {
+  b.setColour(juce::TextButton::buttonColourId, colour);
+  b.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+  b.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
+}
+
 BackingTrackTriggerEditor::BackingTrackTriggerEditor(
     BackingTrackTriggerProcessor &p)
-    : AudioProcessorEditor(&p), processorRef(p), waveformDisplay(p) {
-  // Set up the Load button
-  loadButton.setColour(juce::TextButton::buttonColourId,
-                       juce::Colour(0xff2d5a27));
-  loadButton.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+    : AudioProcessorEditor(&p), processorRef(p), waveformDisplay(p),
+      levelMeter(p) {
+  auto &state = processorRef.apvts;
+
+  // Transport / file buttons.
+  styleButton(loadButton, juce::Colour(0xff2d5a27));
   loadButton.onClick = [this] { loadButtonClicked(); };
+  loadButton.setTooltip("Load an audio file (WAV/AIFF/MP3/FLAC/OGG)");
   addAndMakeVisible(loadButton);
 
-  // Set up the Play button
-  playButton.setColour(juce::TextButton::buttonColourId,
-                       juce::Colour(0xff1e88e5));
-  playButton.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
-  playButton.onClick = [this] { processorRef.startPlayback(); };
+  styleButton(clearButton, juce::Colour(0xff555555));
+  clearButton.onClick = [this] {
+    processorRef.clearSample();
+    updateSampleInfo();
+    waveformDisplay.repaint();
+  };
+  clearButton.setTooltip("Unload the current sample");
+  addAndMakeVisible(clearButton);
+
+  styleButton(playButton, juce::Colour(0xff1e88e5));
+  playButton.onClick = [this] { processorRef.triggerPlayback(); };
+  playButton.setTooltip("Audition the sample from the start offset");
   addAndMakeVisible(playButton);
 
-  // Set up the Stop button
-  stopButton.setColour(juce::TextButton::buttonColourId,
-                       juce::Colour(0xffe53935));
-  stopButton.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+  styleButton(stopButton, juce::Colour(0xffe53935));
   stopButton.onClick = [this] { processorRef.stopPlayback(); };
   addAndMakeVisible(stopButton);
 
-  // Set up the Reset Offset button
-  resetOffsetButton.setColour(juce::TextButton::buttonColourId,
-                              juce::Colour(0xff6a5acd));
-  resetOffsetButton.setColour(juce::TextButton::textColourOnId,
-                              juce::Colours::white);
+  // Zoom + reset.
+  styleButton(zoomInButton, juce::Colour(0xff444466));
+  zoomInButton.onClick = [this] {
+    waveformDisplay.setZoom(waveformDisplay.getZoom() * 2.0f);
+  };
+  addAndMakeVisible(zoomInButton);
+
+  styleButton(zoomOutButton, juce::Colour(0xff444466));
+  zoomOutButton.onClick = [this] {
+    waveformDisplay.setZoom(waveformDisplay.getZoom() / 2.0f);
+  };
+  addAndMakeVisible(zoomOutButton);
+
+  styleButton(resetOffsetButton, juce::Colour(0xff6a5acd));
   resetOffsetButton.onClick = [this] {
     processorRef.setStartOffsetSeconds(0.0);
     waveformDisplay.setZoom(1.0f);
@@ -38,180 +275,235 @@ BackingTrackTriggerEditor::BackingTrackTriggerEditor(
     updateSampleInfo();
     waveformDisplay.repaint();
   };
+  resetOffsetButton.setTooltip("Reset start offset and zoom");
   addAndMakeVisible(resetOffsetButton);
 
-  // Zoom buttons
-  zoomInButton.setColour(juce::TextButton::buttonColourId,
-                         juce::Colour(0xff444466));
-  zoomInButton.setColour(juce::TextButton::textColourOnId,
-                         juce::Colours::white);
-  zoomInButton.onClick = [this] {
-    waveformDisplay.setZoom(waveformDisplay.getZoom() * 2.0f);
-  };
-  addAndMakeVisible(zoomInButton);
+  // Waveform + meter.
+  waveformDisplay.onOffsetChanged = [this] { updateSampleInfo(); };
+  waveformDisplay.onFileDropped = [this](const juce::File &f) { doLoadFile(f); };
+  addAndMakeVisible(waveformDisplay);
+  addAndMakeVisible(levelMeter);
 
-  zoomOutButton.setColour(juce::TextButton::buttonColourId,
-                          juce::Colour(0xff444466));
-  zoomOutButton.setColour(juce::TextButton::textColourOnId,
-                          juce::Colours::white);
-  zoomOutButton.onClick = [this] {
-    waveformDisplay.setZoom(waveformDisplay.getZoom() / 2.0f);
-  };
-  addAndMakeVisible(zoomOutButton);
+  // Gain slider.
+  gainSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+  gainSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 64, 20);
+  gainSlider.setTextValueSuffix(" dB");
+  gainSlider.setColour(juce::Slider::trackColourId, kAccent);
+  gainSlider.setTooltip("Output level");
+  addAndMakeVisible(gainSlider);
+  gainAttach =
+      std::make_unique<APVTS::SliderAttachment>(state, "gain", gainSlider);
 
-  // Sample name label
-  sampleNameLabel.setFont(juce::Font(16.0f, juce::Font::bold));
+  gainLabel.setText("Gain", juce::dontSendNotification);
+  gainLabel.setColour(juce::Label::textColourId, juce::Colours::white);
+  addAndMakeVisible(gainLabel);
+
+  // Trigger-note selector.
+  triggerNoteSlider.setSliderStyle(juce::Slider::IncDecButtons);
+  triggerNoteSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 60, 22);
+  triggerNoteSlider.textFromValueFunction = [](double v) {
+    const int iv = static_cast<int>(v);
+    return iv >= 128 ? juce::String("Any")
+                     : juce::MidiMessage::getMidiNoteName(iv, true, true, 4);
+  };
+  triggerNoteSlider.valueFromTextFunction = [](const juce::String &t) {
+    if (t.trim().equalsIgnoreCase("any"))
+      return 128.0;
+    return static_cast<double>(t.getIntValue());
+  };
+  triggerNoteSlider.setTooltip("Which MIDI note triggers playback (Any = all)");
+  addAndMakeVisible(triggerNoteSlider);
+  triggerNoteAttach = std::make_unique<APVTS::SliderAttachment>(
+      state, "triggerNote", triggerNoteSlider);
+
+  triggerNoteLabel.setText("Trigger note", juce::dontSendNotification);
+  triggerNoteLabel.setColour(juce::Label::textColourId, juce::Colours::white);
+  addAndMakeVisible(triggerNoteLabel);
+
+  // Toggle buttons.
+  auto setupToggle = [this](juce::ToggleButton &b, const juce::String &tip) {
+    b.setColour(juce::ToggleButton::textColourId, juce::Colours::white);
+    b.setColour(juce::ToggleButton::tickColourId, kAccent);
+    b.setTooltip(tip);
+    addAndMakeVisible(b);
+  };
+  setupToggle(loopButton, "Loop the sample until note-off / stop");
+  setupToggle(retriggerButton, "A new note restarts playback from the offset");
+  setupToggle(noteOffButton, "Releasing the key fades the sample out");
+  setupToggle(followButton,
+              "Stop/rewind playback when the host transport stops");
+  embedButton.setColour(juce::ToggleButton::textColourId, juce::Colours::white);
+  embedButton.setColour(juce::ToggleButton::tickColourId, kOffsetGreen);
+  embedButton.setTooltip(
+      "Save the audio inside the project so it travels with the score");
+  embedButton.setToggleState(processorRef.isEmbedEnabled(),
+                             juce::dontSendNotification);
+  embedButton.onClick = [this] {
+    processorRef.setEmbedEnabled(embedButton.getToggleState());
+  };
+  addAndMakeVisible(embedButton);
+
+  loopAttach = std::make_unique<APVTS::ButtonAttachment>(state, "loop",
+                                                         loopButton);
+  retriggerAttach = std::make_unique<APVTS::ButtonAttachment>(
+      state, "retrigger", retriggerButton);
+  noteOffAttach = std::make_unique<APVTS::ButtonAttachment>(
+      state, "noteOffStops", noteOffButton);
+  followAttach = std::make_unique<APVTS::ButtonAttachment>(
+      state, "followTransport", followButton);
+
+  // Labels.
+  sampleNameLabel.setFont(juce::Font(juce::FontOptions(16.0f).withStyle("Bold")));
   sampleNameLabel.setColour(juce::Label::textColourId, juce::Colours::white);
-  sampleNameLabel.setJustificationType(juce::Justification::centredLeft);
   addAndMakeVisible(sampleNameLabel);
 
-  // Duration label
-  durationLabel.setFont(juce::Font(14.0f));
   durationLabel.setColour(juce::Label::textColourId, juce::Colour(0xffaaaaaa));
   durationLabel.setJustificationType(juce::Justification::centredRight);
   addAndMakeVisible(durationLabel);
 
-  // File info label
-  fileInfoLabel.setFont(juce::Font(11.0f));
-  fileInfoLabel.setColour(juce::Label::textColourId, juce::Colour(0xff00d9ff));
-  fileInfoLabel.setJustificationType(juce::Justification::centredLeft);
+  fileInfoLabel.setFont(juce::Font(juce::FontOptions(11.0f)));
+  fileInfoLabel.setColour(juce::Label::textColourId, kAccent);
   addAndMakeVisible(fileInfoLabel);
 
-  // Host info label
-  hostInfoLabel.setFont(juce::Font(11.0f));
+  hostInfoLabel.setFont(juce::Font(juce::FontOptions(11.0f)));
   hostInfoLabel.setColour(juce::Label::textColourId, juce::Colour(0xff88ff88));
   hostInfoLabel.setJustificationType(juce::Justification::centredRight);
   addAndMakeVisible(hostInfoLabel);
 
-  // Offset display label
-  offsetDisplayLabel.setFont(juce::Font(12.0f, juce::Font::bold));
-  offsetDisplayLabel.setColour(juce::Label::textColourId,
-                               juce::Colour(0xff00ff00));
-  offsetDisplayLabel.setJustificationType(juce::Justification::centredLeft);
+  offsetDisplayLabel.setFont(
+      juce::Font(juce::FontOptions(12.0f).withStyle("Bold")));
+  offsetDisplayLabel.setColour(juce::Label::textColourId, kOffsetGreen);
   addAndMakeVisible(offsetDisplayLabel);
 
-  // Offset input label
   offsetInputLabel.setText("Set ms:", juce::dontSendNotification);
-  offsetInputLabel.setFont(juce::Font(11.0f));
-  offsetInputLabel.setColour(juce::Label::textColourId,
-                             juce::Colour(0xffaaaaaa));
+  offsetInputLabel.setFont(juce::Font(juce::FontOptions(11.0f)));
+  offsetInputLabel.setColour(juce::Label::textColourId, juce::Colour(0xffaaaaaa));
   offsetInputLabel.setJustificationType(juce::Justification::centredRight);
   addAndMakeVisible(offsetInputLabel);
 
-  // Offset text input
-  offsetInput.setFont(juce::Font(12.0f));
   offsetInput.setJustification(juce::Justification::centred);
   offsetInput.setColour(juce::TextEditor::backgroundColourId,
                         juce::Colour(0xff2a2a4a));
   offsetInput.setColour(juce::TextEditor::textColourId, juce::Colours::white);
-  offsetInput.setColour(juce::TextEditor::outlineColourId,
-                        juce::Colour(0xff00ff00));
+  offsetInput.setColour(juce::TextEditor::outlineColourId, kOffsetGreen);
   offsetInput.setInputRestrictions(8, "0123456789");
   offsetInput.setTextToShowWhenEmpty("0", juce::Colour(0xff666666));
   offsetInput.onReturnKey = [this] { applyOffsetFromInput(); };
   offsetInput.onFocusLost = [this] { applyOffsetFromInput(); };
   addAndMakeVisible(offsetInput);
 
-  // Instruction label
   instructionLabel.setText(
-      "MIDI Note-On triggers playback. Use +/- to zoom, scroll wheel to pan.",
+      "MIDI note triggers playback - drop audio onto the waveform, "
+      "+/- to zoom, scroll to pan.",
       juce::dontSendNotification);
-  instructionLabel.setFont(juce::Font(10.0f, juce::Font::italic));
-  instructionLabel.setColour(juce::Label::textColourId,
-                             juce::Colour(0xff888888));
+  instructionLabel.setFont(
+      juce::Font(juce::FontOptions(10.0f).withStyle("Italic")));
+  instructionLabel.setColour(juce::Label::textColourId, juce::Colour(0xff888888));
   instructionLabel.setJustificationType(juce::Justification::centred);
   addAndMakeVisible(instructionLabel);
 
-  // Waveform display
-  waveformDisplay.onOffsetChanged = [this] { updateSampleInfo(); };
-  addAndMakeVisible(waveformDisplay);
+  // Keep the UI in sync when state is restored or a sample is (re)loaded.
+  processorRef.onSampleChanged = [this] {
+    juce::MessageManager::callAsync([safe = juce::Component::SafePointer<
+                                         BackingTrackTriggerEditor>(this)] {
+      if (safe != nullptr) {
+        safe->updateSampleInfo();
+        safe->waveformDisplay.repaint();
+      }
+    });
+  };
 
-  // Update display
   updateSampleInfo();
-
-  // Larger size
-  setSize(650, 450);
+  setSize(700, 560);
 }
 
-BackingTrackTriggerEditor::~BackingTrackTriggerEditor() {}
+BackingTrackTriggerEditor::~BackingTrackTriggerEditor() {
+  processorRef.onSampleChanged = nullptr;
+}
 
 //==============================================================================
 void BackingTrackTriggerEditor::paint(juce::Graphics &g) {
-  // Dark gradient background
   juce::ColourGradient gradient(juce::Colour(0xff0f0f23), 0, 0,
                                 juce::Colour(0xff1a1a3e), 0,
                                 static_cast<float>(getHeight()), false);
   g.setGradientFill(gradient);
   g.fillAll();
 
-  // Title
   g.setColour(juce::Colours::white);
-  g.setFont(juce::Font(24.0f, juce::Font::bold));
-  g.drawText("Backing Track Trigger", 20, 10, getWidth() - 40, 35,
+  g.setFont(juce::Font(juce::FontOptions(24.0f).withStyle("Bold")));
+  g.drawText("Backing Track Trigger", 20, 10, getWidth() - 40, 32,
              juce::Justification::centred);
 
-  // Subtitle with version
-  g.setColour(juce::Colour(0xff00d9ff));
-  g.setFont(juce::Font(12.0f));
-  g.drawText("One-Shot Sample Player for MuseScore  |  v1.2.0", 20, 40,
-             getWidth() - 40, 20, juce::Justification::centred);
+  g.setColour(kAccent);
+  g.setFont(12.0f);
+  g.drawText("One-Shot Sample Player  |  v2.0.0", 20, 40, getWidth() - 40, 18,
+             juce::Justification::centred);
 }
 
 void BackingTrackTriggerEditor::resized() {
   auto area = getLocalBounds().reduced(20);
+  area.removeFromTop(48); // title
 
-  // Reserve top space for title
-  area.removeFromTop(65);
-
-  // Sample info row
-  auto infoRow = area.removeFromTop(25);
+  auto infoRow = area.removeFromTop(24);
   sampleNameLabel.setBounds(infoRow.removeFromLeft(infoRow.getWidth() * 2 / 3));
   durationLabel.setBounds(infoRow);
 
-  area.removeFromTop(5);
-
-  // File info row
+  area.removeFromTop(2);
   auto fileInfoRow = area.removeFromTop(18);
-  fileInfoLabel.setBounds(
-      fileInfoRow.removeFromLeft(fileInfoRow.getWidth() / 2));
+  fileInfoLabel.setBounds(fileInfoRow.removeFromLeft(fileInfoRow.getWidth() / 2));
   hostInfoLabel.setBounds(fileInfoRow);
 
-  area.removeFromTop(8);
-
-  // Waveform display with zoom buttons on the side
+  area.removeFromTop(6);
   auto waveformRow = area.removeFromTop(180);
-  auto zoomButtonArea = waveformRow.removeFromRight(35);
-  zoomInButton.setBounds(zoomButtonArea.removeFromTop(40));
-  zoomButtonArea.removeFromTop(5);
-  zoomOutButton.setBounds(zoomButtonArea.removeFromTop(40));
+  levelMeter.setBounds(waveformRow.removeFromRight(14));
+  waveformRow.removeFromRight(6);
+  auto sideCol = waveformRow.removeFromRight(40);
+  zoomInButton.setBounds(sideCol.removeFromTop(40));
+  sideCol.removeFromTop(4);
+  zoomOutButton.setBounds(sideCol.removeFromTop(40));
+  sideCol.removeFromTop(4);
+  resetOffsetButton.setBounds(sideCol.removeFromTop(30));
+  waveformRow.removeFromRight(6);
   waveformDisplay.setBounds(waveformRow);
 
-  area.removeFromTop(8);
-
-  // Offset row: display on left, input on right
-  auto offsetRow = area.removeFromTop(25);
-  offsetDisplayLabel.setBounds(
-      offsetRow.removeFromLeft(offsetRow.getWidth() / 2));
+  area.removeFromTop(6);
+  auto offsetRow = area.removeFromTop(26);
+  offsetDisplayLabel.setBounds(offsetRow.removeFromLeft(offsetRow.getWidth() / 2));
   offsetInput.setBounds(offsetRow.removeFromRight(70));
   offsetInputLabel.setBounds(offsetRow);
 
-  area.removeFromTop(10);
-
-  // Button row
-  auto buttonRow = area.removeFromTop(40);
-  int buttonWidth = (buttonRow.getWidth() - 30) / 4;
-
-  loadButton.setBounds(buttonRow.removeFromLeft(buttonWidth));
-  buttonRow.removeFromLeft(10);
-  playButton.setBounds(buttonRow.removeFromLeft(buttonWidth));
-  buttonRow.removeFromLeft(10);
-  stopButton.setBounds(buttonRow.removeFromLeft(buttonWidth));
-  buttonRow.removeFromLeft(10);
-  resetOffsetButton.setBounds(buttonRow);
+  area.removeFromTop(8);
+  auto transportRow = area.removeFromTop(36);
+  const int bw = (transportRow.getWidth() - 30) / 4;
+  loadButton.setBounds(transportRow.removeFromLeft(bw));
+  transportRow.removeFromLeft(10);
+  clearButton.setBounds(transportRow.removeFromLeft(bw));
+  transportRow.removeFromLeft(10);
+  playButton.setBounds(transportRow.removeFromLeft(bw));
+  transportRow.removeFromLeft(10);
+  stopButton.setBounds(transportRow);
 
   area.removeFromTop(10);
+  auto gainRow = area.removeFromTop(28);
+  gainLabel.setBounds(gainRow.removeFromLeft(50));
+  gainSlider.setBounds(gainRow);
 
-  // Instruction label
+  area.removeFromTop(6);
+  auto noteRow = area.removeFromTop(26);
+  triggerNoteLabel.setBounds(noteRow.removeFromLeft(90));
+  triggerNoteSlider.setBounds(noteRow.removeFromLeft(150));
+  noteRow.removeFromLeft(15);
+  embedButton.setBounds(noteRow);
+
+  area.removeFromTop(8);
+  auto toggleRow = area.removeFromTop(26);
+  const int tw = toggleRow.getWidth() / 4;
+  loopButton.setBounds(toggleRow.removeFromLeft(tw));
+  retriggerButton.setBounds(toggleRow.removeFromLeft(tw));
+  noteOffButton.setBounds(toggleRow.removeFromLeft(tw));
+  followButton.setBounds(toggleRow);
+
+  area.removeFromTop(8);
   instructionLabel.setBounds(area.removeFromTop(20));
 }
 
@@ -221,29 +513,30 @@ void BackingTrackTriggerEditor::loadButtonClicked() {
       "Select an audio file to load...", juce::File{},
       "*.wav;*.aiff;*.aif;*.mp3;*.flac;*.ogg");
 
-  auto fileChooserFlags = juce::FileBrowserComponent::openMode |
-                          juce::FileBrowserComponent::canSelectFiles;
+  const auto flags = juce::FileBrowserComponent::openMode |
+                     juce::FileBrowserComponent::canSelectFiles;
 
-  fileChooser->launchAsync(fileChooserFlags,
-                           [this](const juce::FileChooser &fc) {
-                             auto file = fc.getResult();
-                             if (file.existsAsFile()) {
-                               processorRef.loadSample(file);
-                               waveformDisplay.setZoom(1.0f);
-                               waveformDisplay.setViewOffset(0.0f);
-                               updateSampleInfo();
-                               waveformDisplay.repaint();
-                             }
-                           });
+  fileChooser->launchAsync(flags, [this](const juce::FileChooser &fc) {
+    auto file = fc.getResult();
+    if (file.existsAsFile())
+      doLoadFile(file);
+  });
+}
+
+void BackingTrackTriggerEditor::doLoadFile(const juce::File &file) {
+  processorRef.loadSample(file);
+  waveformDisplay.setZoom(1.0f);
+  waveformDisplay.setViewOffset(0.0f);
+  updateSampleInfo();
+  waveformDisplay.repaint();
 }
 
 void BackingTrackTriggerEditor::applyOffsetFromInput() {
-  juce::String text = offsetInput.getText();
+  auto text = offsetInput.getText();
   if (text.isNotEmpty()) {
-    int ms = text.getIntValue();
+    const int ms = text.getIntValue();
     if (ms >= 0) {
-      double seconds = ms / 1000.0;
-      processorRef.setStartOffsetSeconds(seconds);
+      processorRef.setStartOffsetSeconds(ms / 1000.0);
       updateSampleInfo();
       waveformDisplay.repaint();
     }
@@ -251,69 +544,61 @@ void BackingTrackTriggerEditor::applyOffsetFromInput() {
 }
 
 void BackingTrackTriggerEditor::updateSampleInfo() {
-  if (processorRef.hasSampleLoaded()) {
-    juce::File file(processorRef.getSampleName());
-    sampleNameLabel.setText(file.getFileName(), juce::dontSendNotification);
+  const bool loaded = processorRef.hasSampleLoaded();
 
-    double seconds = processorRef.getSampleLengthSeconds();
-    int mins = static_cast<int>(seconds) / 60;
-    int secs = static_cast<int>(seconds) % 60;
-    durationLabel.setText(juce::String::formatted("%d:%02d", mins, secs),
-                          juce::dontSendNotification);
+  if (loaded) {
+    sampleNameLabel.setText(processorRef.getSampleName(),
+                            juce::dontSendNotification);
 
-    juce::String channelStr =
-        (processorRef.getOriginalNumChannels() == 1) ? "Mono" : "Stereo";
-    juce::String fileInfo = juce::String::formatted(
-        "File: %.0f Hz | %s | %d-bit", processorRef.getOriginalSampleRate(),
-        channelStr.toRawUTF8(), processorRef.getOriginalBitsPerSample());
-    fileInfoLabel.setText(fileInfo, juce::dontSendNotification);
+    const double seconds = processorRef.getSampleLengthSeconds();
+    durationLabel.setText(
+        juce::String::formatted("%d:%02d", static_cast<int>(seconds) / 60,
+                                static_cast<int>(seconds) % 60),
+        juce::dontSendNotification);
 
-    juce::String hostInfo = juce::String::formatted(
+    const juce::String channels =
+        processorRef.getOriginalNumChannels() == 1 ? "Mono" : "Stereo";
+    fileInfoLabel.setText(
+        juce::String::formatted("File: %.0f Hz | %s | %d-bit",
+                                processorRef.getOriginalSampleRate(),
+                                channels.toRawUTF8(),
+                                processorRef.getOriginalBitsPerSample()),
+        juce::dontSendNotification);
+
+    juce::String host = juce::String::formatted(
         "Host: %.0f Hz", processorRef.getHostSampleRate());
     if (processorRef.isResampled()) {
-      hostInfo += " (Resampled)";
-      hostInfoLabel.setColour(juce::Label::textColourId,
-                              juce::Colour(0xffffaa00));
+      host += " (resampled)";
+      hostInfoLabel.setColour(juce::Label::textColourId, juce::Colour(0xffffaa00));
     } else {
-      hostInfoLabel.setColour(juce::Label::textColourId,
-                              juce::Colour(0xff88ff88));
+      hostInfoLabel.setColour(juce::Label::textColourId, juce::Colour(0xff88ff88));
     }
-    hostInfoLabel.setText(hostInfo, juce::dontSendNotification);
+    hostInfoLabel.setText(host, juce::dontSendNotification);
 
-    // Offset display
-    double offsetSec = processorRef.getStartOffsetSeconds();
-    int offsetMs = static_cast<int>(offsetSec * 1000);
-
-    if (offsetSec >= 1.0) {
-      int offsetMins = static_cast<int>(offsetSec) / 60;
-      int offsetSecs = static_cast<int>(offsetSec) % 60;
+    const double offsetSec = processorRef.getStartOffsetSeconds();
+    const int offsetMs = static_cast<int>(offsetSec * 1000);
+    if (offsetSec >= 1.0)
       offsetDisplayLabel.setText(
-          juce::String::formatted("Start: %d:%02d.%03d (%d ms)", offsetMins,
-                                  offsetSecs, offsetMs % 1000, offsetMs),
+          juce::String::formatted("Start: %d:%02d.%03d (%d ms)",
+                                  static_cast<int>(offsetSec) / 60,
+                                  static_cast<int>(offsetSec) % 60,
+                                  offsetMs % 1000, offsetMs),
           juce::dontSendNotification);
-    } else if (offsetMs > 0) {
+    else
       offsetDisplayLabel.setText(
-          juce::String::formatted("Start Offset: %d ms", offsetMs),
+          juce::String::formatted("Start offset: %d ms", offsetMs),
           juce::dontSendNotification);
-    } else {
-      offsetDisplayLabel.setText("Start Offset: 0 ms",
-                                 juce::dontSendNotification);
-    }
 
-    // Update input field (without triggering callback)
     offsetInput.setText(juce::String(offsetMs), false);
-
   } else {
     sampleNameLabel.setText("No sample loaded", juce::dontSendNotification);
     durationLabel.setText("--:--", juce::dontSendNotification);
     fileInfoLabel.setText("", juce::dontSendNotification);
     offsetDisplayLabel.setText("", juce::dontSendNotification);
     offsetInput.setText("", false);
-
-    juce::String hostInfo = juce::String::formatted(
-        "Host: %.0f Hz", processorRef.getHostSampleRate());
-    hostInfoLabel.setColour(juce::Label::textColourId,
-                            juce::Colour(0xff88ff88));
-    hostInfoLabel.setText(hostInfo, juce::dontSendNotification);
+    hostInfoLabel.setColour(juce::Label::textColourId, juce::Colour(0xff88ff88));
+    hostInfoLabel.setText(juce::String::formatted(
+                              "Host: %.0f Hz", processorRef.getHostSampleRate()),
+                          juce::dontSendNotification);
   }
 }

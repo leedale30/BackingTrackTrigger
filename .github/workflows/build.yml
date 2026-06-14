@@ -1,0 +1,57 @@
+name: Build & Validate (macOS)
+
+on:
+  push:
+    branches: [main, "**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  JUCE_TAG: "8.0.8"
+  BUILD_TYPE: Release
+
+jobs:
+  macos:
+    name: macOS build, test & validate
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch JUCE ${{ env.JUCE_TAG }}
+        run: |
+          rm -rf JUCE
+          git clone --depth 1 --branch "$JUCE_TAG" https://github.com/juce-framework/JUCE.git JUCE
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DBTT_BUILD_TESTS=ON
+
+      - name: Build (VST3 / AU / Standalone)
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel 4
+
+      - name: Run unit tests
+        run: |
+          cmake --build build --target BackingTrackTriggerTests --config ${{ env.BUILD_TYPE }}
+          ctest --test-dir build --output-on-failure
+
+      - name: Validate with pluginval
+        run: |
+          VST3=$(find build -name "*.vst3" -type d | head -n1)
+          echo "Validating: $VST3"
+          curl -sSL https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_macOS.zip -o pluginval.zip
+          unzip -oq pluginval.zip -d pluginval_bin
+          PV=pluginval_bin/pluginval.app/Contents/MacOS/pluginval
+          chmod +x "$PV"
+          "$PV" --strictness-level 8 --validate-in-process --timeout-ms 300000 --validate "$VST3"
+
+      - name: Upload plugins
+        uses: actions/upload-artifact@v4
+        with:
+          name: BackingTrackTrigger-macOS
+          path: |
+            build/**/Release/VST3/**/*.vst3
+            build/**/Release/AU/**/*.component
+            build/**/Release/Standalone/**/*.app
+          if-no-files-found: warn
