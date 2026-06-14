@@ -1,5 +1,7 @@
-# Build directory
+# Build directories
 build/
+build-*/
+cmake-build-*/
 
 # IDE files
 .idea/
@@ -12,6 +14,11 @@ build/
 *.a
 *.dylib
 *.vst3
+*.component
+
+# Downloaded tooling
+pluginval*
+*.zip
 
 # macOS
 .DS_Store

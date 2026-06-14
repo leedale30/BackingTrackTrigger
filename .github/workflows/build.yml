@@ -1,0 +1,132 @@
+name: Build & Validate
+
+on:
+  push:
+    branches: [main, "**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  JUCE_TAG: "8.0.8"
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+          - name: Windows
+            os: windows-latest
+          - name: Linux
+            os: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libjack-jackd2-dev libfreetype6-dev \
+            libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
+            libxinerama-dev libxrandr-dev libxrender-dev \
+            libfontconfig1-dev libglu1-mesa-dev
+
+      - name: Fetch JUCE ${{ env.JUCE_TAG }}
+        shell: bash
+        run: |
+          rm -rf JUCE
+          git clone --depth 1 --branch "$JUCE_TAG" https://github.com/juce-framework/JUCE.git JUCE
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel 4
+
+      - name: Locate VST3 (macOS / Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          VST3=$(find build -name "*.vst3" -type d | head -n1)
+          echo "VST3_PATH=$VST3" >> "$GITHUB_ENV"
+          echo "Built: $VST3"
+
+      - name: Locate VST3 (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          VST3=$(find build -name "*.vst3" | head -n1)
+          echo "VST3_PATH=$VST3" >> "$GITHUB_ENV"
+          echo "Built: $VST3"
+
+      - name: Download pluginval
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            macOS)   URL=https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_macOS.zip ;;
+            Windows) URL=https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip ;;
+            Linux)   URL=https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Linux.zip ;;
+          esac
+          curl -sSL "$URL" -o pluginval.zip
+          unzip -o pluginval.zip -d pluginval_bin
+
+      - name: Validate plugin
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            macOS)   PV=pluginval_bin/pluginval.app/Contents/MacOS/pluginval ;;
+            Windows) PV=pluginval_bin/pluginval.exe ;;
+            Linux)   PV=pluginval_bin/pluginval ;;
+          esac
+          chmod +x "$PV" || true
+          "$PV" --strictness-level 8 --validate-in-process --timeout-ms 300000 \
+                --validate "$VST3_PATH"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: BackingTrackTrigger-${{ matrix.name }}
+          path: |
+            build/**/*.vst3
+            build/**/*.component
+            build/**/Standalone/**/*
+          if-no-files-found: warn
+
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libjack-jackd2-dev libfreetype6-dev \
+            libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
+            libxinerama-dev libxrandr-dev libxrender-dev \
+            libfontconfig1-dev libglu1-mesa-dev
+
+      - name: Fetch JUCE ${{ env.JUCE_TAG }}
+        run: |
+          rm -rf JUCE
+          git clone --depth 1 --branch "$JUCE_TAG" https://github.com/juce-framework/JUCE.git JUCE
+
+      - name: Configure with tests
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DBTT_BUILD_TESTS=ON
+
+      - name: Build tests
+        run: cmake --build build --target BackingTrackTriggerTests --parallel 4
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
