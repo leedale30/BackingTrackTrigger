@@ -111,10 +111,13 @@ embedded audio).
 
 ## Continuous integration
 
-GitHub Actions builds VST3/AU/Standalone on macOS, Windows, and Linux, validates
-the plugin with [pluginval](https://github.com/Tracktion/pluginval) at strictness
-level 8, runs the unit tests, and uploads the built plugins as artifacts. See
-[`.github/workflows/build.yml`](.github/workflows/build.yml).
+macOS is the primary supported target. GitHub Actions builds VST3/AU/Standalone
+on macOS, runs the unit tests, validates the plugin with
+[pluginval](https://github.com/Tracktion/pluginval) at strictness level 8, and
+uploads the built plugins as artifacts. See
+[`.github/workflows/build.yml`](.github/workflows/build.yml). The CMake build is
+cross-platform and the source has no macOS-specific code, so Windows/Linux builds
+should also work — they're just not part of CI right now.
 
 ## Controls reference
 
